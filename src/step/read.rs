@@ -740,6 +740,7 @@ fn weight(file: &File, solid: u64) -> usize {
 /// Builds each distinct solid once. Solids share nothing but the file, so they are built on as
 /// many threads as the machine offers, each with its own geometry cache, heaviest first so that
 /// no long build starts last. Each result is filed under its own key, whatever finished first.
+/// With one thread to use, or none to spawn (wasm32-wasip1), the one worker runs on this thread.
 fn build_all(file: &File, keys: &[Key]) -> HashMap<Key, Built> {
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
@@ -751,30 +752,33 @@ fn build_all(file: &File, keys: &[Key]) -> HashMap<Key, Built> {
         .collect();
     order.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     let next = AtomicUsize::new(0);
-    let results: Vec<Vec<(usize, Built)>> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut geo = Geometry::new(file);
-                    let mut mine = Vec::new();
-                    while let Some(&(_, k)) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let (solid, context, scale) = keys[k];
-                        let r = geo
-                            .use_scaled(context, f64::from_bits(scale))
-                            .and_then(|_| topology::solid(&mut geo, solid))
-                            .map(|(b, names, healed)| (b, names, healed, geo.uncertainty()))
-                            .map_err(|e| e.to_string());
-                        mine.push((k, r));
-                    }
-                    mine
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .map(|w| w.join().unwrap_or_default())
-            .collect()
-    });
+    let work = || {
+        let mut geo = Geometry::new(file);
+        let mut mine = Vec::new();
+        while let Some(&(_, k)) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
+            let (solid, context, scale) = keys[k];
+            let r = geo
+                .use_scaled(context, f64::from_bits(scale))
+                .and_then(|_| topology::solid(&mut geo, solid))
+                .map(|(b, names, healed)| (b, names, healed, geo.uncertainty()))
+                .map_err(|e| e.to_string());
+            mine.push((k, r));
+        }
+        mine
+    };
+    let results: Vec<Vec<(usize, Built)>> = if threads <= 1 {
+        // As `mesh::par_map` does: no thread is spawned. Where panics unwind, a panic rejects
+        // this worker's solids, as a failed worker thread's are.
+        vec![std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_default()]
+    } else {
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads).map(|_| scope.spawn(work)).collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().unwrap_or_default())
+                .collect()
+        })
+    };
     let mut out = HashMap::new();
     for (k, r) in results.into_iter().flatten() {
         out.insert(keys[k], r);
