@@ -27,6 +27,7 @@ use crate::{
     Error, Result,
     geom::Curve,
     math::{Point3, Vec2, Vec3},
+    threads,
     topo::{Brep, CoedgeId, EdgeId, FaceId, SolidId},
 };
 
@@ -829,33 +830,18 @@ fn split_shared_chords(b: &Brep, ids: &[FaceId], meshes: &mut [face::FaceMesh]) 
 
 /// `f(0..n)` in order, spread over the machine's threads.
 fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |x| x.get())
-        .min(n);
-    if threads <= 1 {
-        return (0..n).map(f).collect();
-    }
     let next = AtomicUsize::new(0);
-    let mut parts: Vec<(usize, T)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut mine = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= n {
-                            break mine;
-                        }
-                        mine.push((i, f(i)));
-                    }
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| w.join().expect("mesh worker panicked"))
-            .collect()
+    let runs = threads::spread(n, || {
+        let mut mine = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break mine;
+            }
+            mine.push((i, f(i)));
+        }
     });
+    let mut parts: Vec<(usize, T)> = runs.into_iter().flatten().collect();
     parts.sort_by_key(|p| p.0);
     parts.into_iter().map(|p| p.1).collect()
 }

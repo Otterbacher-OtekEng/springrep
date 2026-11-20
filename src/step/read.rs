@@ -14,6 +14,7 @@ use super::{
 use crate::{
     Error, Result, check,
     math::Point3,
+    threads,
     topo::{Brep, FaceId, FaceName, SolidId},
 };
 
@@ -737,14 +738,31 @@ fn weight(file: &File, solid: u64) -> usize {
     total
 }
 
+/// What `build` makes with `cache`, or a rejection where it panics, so that a solid whose build
+/// panics is rejected alone. A panic may leave `cache` half-written: an instance it was converting
+/// stays marked as open, and the next solid to use that instance would be refused as referring to
+/// itself. So `cache` is then replaced by a `fresh` one.
+///
+/// This holds only where panics unwind. Where they abort, as on wasm32-wasip1, a solid whose
+/// build panics ends the whole read.
+fn guarded<C, T>(
+    cache: &mut C,
+    fresh: impl FnOnce() -> C,
+    build: impl FnOnce(&mut C) -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&mut *cache)));
+    built.unwrap_or_else(|_| {
+        *cache = fresh();
+        Err("its build panicked".to_string())
+    })
+}
+
 /// Builds each distinct solid once. Solids share nothing but the file, so they are built on as
 /// many threads as the machine offers, each with its own geometry cache, heaviest first so that
 /// no long build starts last. Each result is filed under its own key, whatever finished first.
-/// With one thread to use, or none to spawn (wasm32-wasip1), the one worker runs on this thread.
+/// A solid whose build panics is rejected and the rest are still built, where panics unwind
+/// ([`guarded`]).
 fn build_all(file: &File, keys: &[Key]) -> HashMap<Key, Built> {
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(keys.len().max(1));
     let mut order: Vec<(usize, usize)> = keys
         .iter()
         .enumerate()
@@ -752,42 +770,28 @@ fn build_all(file: &File, keys: &[Key]) -> HashMap<Key, Built> {
         .collect();
     order.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     let next = AtomicUsize::new(0);
-    let work = || {
+    let results: Vec<Vec<(usize, Built)>> = threads::spread(keys.len(), || {
         let mut geo = Geometry::new(file);
         let mut mine = Vec::new();
         while let Some(&(_, k)) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
             let (solid, context, scale) = keys[k];
-            let r = geo
-                .use_scaled(context, f64::from_bits(scale))
-                .and_then(|_| topology::solid(&mut geo, solid))
-                .map(|(b, names, healed)| (b, names, healed, geo.uncertainty()))
-                .map_err(|e| e.to_string());
+            let r = guarded(
+                &mut geo,
+                || Geometry::new(file),
+                |geo| {
+                    geo.use_scaled(context, f64::from_bits(scale))
+                        .and_then(|_| topology::solid(geo, solid))
+                        .map(|(b, names, healed)| (b, names, healed, geo.uncertainty()))
+                        .map_err(|e| e.to_string())
+                },
+            );
             mine.push((k, r));
         }
         mine
-    };
-    let results: Vec<Vec<(usize, Built)>> = if threads <= 1 {
-        // As `mesh::par_map` does: no thread is spawned. Where panics unwind, a panic rejects
-        // this worker's solids, as a failed worker thread's are.
-        vec![std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_default()]
-    } else {
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads).map(|_| scope.spawn(work)).collect();
-            workers
-                .into_iter()
-                .map(|w| w.join().unwrap_or_default())
-                .collect()
-        })
-    };
-    let mut out = HashMap::new();
-    for (k, r) in results.into_iter().flatten() {
-        out.insert(keys[k], r);
-    }
-    for &k in keys {
-        out.entry(k)
-            .or_insert_with(|| Err("the thread building it failed".to_string()));
-    }
-    out
+    });
+    // Every key was taken by one run or another, and each one taken was filed.
+    let built = results.into_iter().flatten();
+    built.map(|(k, r)| (keys[k], r)).collect()
 }
 
 /// The names a face this kernel wrote carries: `feature.face` entries joined by `;`.
@@ -798,4 +802,55 @@ fn parse_names(s: &str) -> Vec<FaceName> {
             Some(FaceName::new(f, face))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::guarded;
+
+    #[test]
+    fn a_build_keeps_its_result_and_its_cache() {
+        // The cache is a list a build adds to, and its result the list's length.
+        let add = |c: &mut Vec<usize>| {
+            c.push(c.len());
+            Ok::<usize, String>(c.len())
+        };
+        let mut cache = Vec::new();
+        assert_eq!(guarded(&mut cache, Vec::new, add), Ok(1));
+        assert_eq!(guarded(&mut cache, Vec::new, add), Ok(2));
+        assert_eq!(cache, [0, 1]);
+        // A build's own error is its result, and keeps the cache too.
+        let refuse = |_: &mut Vec<usize>| Err::<usize, String>("no".into());
+        assert_eq!(guarded(&mut cache, Vec::new, refuse), Err("no".into()));
+        assert_eq!(cache, [0, 1]);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn a_build_that_panics_is_rejected_alone_and_its_cache_replaced() {
+        // Five solids built in turn with one cache, as one worker builds them. Each adds itself to
+        // the cache and returns what the cache then holds; the third panics once it has.
+        let mut cache: Vec<usize> = Vec::new();
+        let built: Vec<Result<Vec<usize>, String>> = (0..5)
+            .map(|k| {
+                guarded(&mut cache, Vec::new, |c| {
+                    c.push(k);
+                    if k == 2 {
+                        panic!("solid {k} cannot be built");
+                    }
+                    Ok(c.clone())
+                })
+            })
+            .collect();
+        // The first two share a cache; the third is rejected; the last two share a new cache,
+        // without the third's mark in it.
+        let want = [
+            Ok(vec![0]),
+            Ok(vec![0, 1]),
+            Err("its build panicked".to_string()),
+            Ok(vec![3]),
+            Ok(vec![3, 4]),
+        ];
+        assert_eq!(built, want);
+    }
 }

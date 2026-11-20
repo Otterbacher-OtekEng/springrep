@@ -511,3 +511,11 @@ fn a_cap_whose_corners_share_a_latitude_meshes() {
     }
     mesh_ok(&cut, &MeshOptions::within(0.03));
 }
+
+#[test]
+fn par_map_gives_each_result_in_its_place() {
+    // However many threads take the items, and whichever takes each.
+    let want: Vec<usize> = (0..1000).map(|i| 3 * i + 1).collect();
+    assert_eq!(super::par_map(1000, |i| 3 * i + 1), want);
+    assert_eq!(super::par_map(0, |i| i), Vec::<usize>::new());
+}

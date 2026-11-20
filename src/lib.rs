@@ -24,6 +24,7 @@ pub mod profile;
 pub mod rays;
 pub mod step;
 pub mod sweep;
+mod threads;
 pub mod tol;
 pub mod topo;
 
